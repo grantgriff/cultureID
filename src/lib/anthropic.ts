@@ -171,6 +171,7 @@ export async function runAnalysis(
 
   // Phase 1: Web search to gather data
   onStageChange("searching");
+  console.log("[analysis] Phase 1: Starting web search for", input.name);
 
   const searchPrompt = `I need you to research the following person for a culture sensing analysis:
 
@@ -192,6 +193,7 @@ After completing all searches, compile everything you found into a detailed summ
 Be thorough but factual — only report what you actually find.`;
 
   let searchFindings = "";
+  let searchCount = 0;
   const searchStream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
     max_tokens: 16000,
@@ -207,7 +209,15 @@ Be thorough but factual — only report what you actually find.`;
   });
 
   for await (const event of searchStream) {
-    if (
+    if (event.type === "content_block_start") {
+      if (
+        event.content_block.type === "server_tool_use" &&
+        event.content_block.name === "web_search"
+      ) {
+        searchCount++;
+        onThinking("searching", `Running search ${searchCount}...\n`);
+      }
+    } else if (
       event.type === "content_block_delta" &&
       event.delta.type === "text_delta"
     ) {
@@ -216,56 +226,39 @@ Be thorough but factual — only report what you actually find.`;
     }
   }
 
-  // Phase 2: Map connections from search findings
-  onStageChange("mapping");
+  console.log(
+    "[analysis] Phase 1 complete:",
+    searchCount,
+    "searches,",
+    searchFindings.length,
+    "chars of findings"
+  );
 
-  const mappingPrompt = `Here are raw research findings about ${input.name}:
-
-${searchFindings}
-
-From these findings, extract a structured map of all people, organizations, and relationships found. For each person identified:
-- Name, company, title (if found)
-- How they relate to ${input.name} (direct colleague, co-author, mentioned together, etc.)
-- Strength of evidence for the connection
-
-Also identify clusters — groups of people who belong together (e.g. same company, same conference circuit, co-authors).
-
-Output a detailed structured summary of the network. Be factual — only include connections with evidence from the search results.`;
-
-  let mappingFindings = "";
-  const mappingStream = client.messages.stream({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 8000,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: mappingPrompt }],
-  });
-
-  for await (const event of mappingStream) {
-    if (
-      event.type === "content_block_delta" &&
-      event.delta.type === "text_delta"
-    ) {
-      mappingFindings += event.delta.text;
-      onThinking("mapping", event.delta.text);
-    }
+  if (!searchFindings.trim()) {
+    console.warn("[analysis] Warning: searchFindings is empty after web search phase");
+    throw new Error(
+      "Web search completed but produced no text summary. The search may have timed out."
+    );
   }
 
-  // Phase 3: Analyze cultural signals
-  onStageChange("analyzing");
+  // Phase 2: Map connections + analyze (single call to reduce latency/timeout risk)
+  onStageChange("mapping");
+  onThinking("mapping", "Extracting network connections from findings...\n");
+  console.log("[analysis] Phase 2: Starting mapping + analysis");
 
   const analysisPrompt = `Here are the research findings about ${input.name}:
 
 ${searchFindings}
 
-Here is the structured network mapping:
-
-${mappingFindings}
-
 ${modeContext}
 
-Now produce the structured analysis. ${ANALYSIS_PROMPT}`;
+First, mentally map out all the people, organizations, and relationships found in the research.
+Then produce the structured analysis.
+
+${ANALYSIS_PROMPT}`;
 
   let analysisText = "";
+  let hasTransitionedToAnalyzing = false;
   const analysisStream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
     max_tokens: 16000,
@@ -279,13 +272,31 @@ Now produce the structured analysis. ${ANALYSIS_PROMPT}`;
       event.delta.type === "text_delta"
     ) {
       analysisText += event.delta.text;
-      onThinking("analyzing", event.delta.text);
+
+      // Transition UI from "mapping" to "analyzing" once we detect JSON output starting
+      if (!hasTransitionedToAnalyzing && analysisText.includes('"target"')) {
+        hasTransitionedToAnalyzing = true;
+        onStageChange("analyzing");
+        console.log("[analysis] Transitioned to analyzing stage");
+      }
+
+      onThinking(
+        hasTransitionedToAnalyzing ? "analyzing" : "mapping",
+        event.delta.text
+      );
     }
   }
 
-  // Phase 4: Parse and generate final output
+  console.log(
+    "[analysis] Phase 2 complete:",
+    analysisText.length,
+    "chars of output"
+  );
+
+  // Phase 3: Parse and generate final output
   onStageChange("generating");
-  onThinking("generating", "Parsing structured output...");
+  onThinking("generating", "Parsing structured output...\n");
+  console.log("[analysis] Phase 3: Parsing JSON output");
 
   // Parse JSON — handle potential markdown fencing
   const jsonMatch = analysisText.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -294,7 +305,7 @@ Now produce the structured analysis. ${ANALYSIS_PROMPT}`;
   let result: AnalysisResult;
   try {
     result = JSON.parse(jsonStr);
-  } catch (parseError) {
+  } catch {
     // Try to extract JSON more aggressively — find first { to last }
     const firstBrace = analysisText.indexOf("{");
     const lastBrace = analysisText.lastIndexOf("}");
@@ -303,18 +314,27 @@ Now produce the structured analysis. ${ANALYSIS_PROMPT}`;
       try {
         result = JSON.parse(extracted);
       } catch {
+        console.error(
+          "[analysis] JSON parse failed. First 200 chars:",
+          analysisText.slice(0, 200)
+        );
         throw new Error(
           "Failed to parse analysis output as JSON. The model returned malformed data."
         );
       }
     } else {
+      console.error(
+        "[analysis] No JSON found. First 200 chars:",
+        analysisText.slice(0, 200)
+      );
       throw new Error(
         "Failed to parse analysis output. No JSON structure found in response."
       );
     }
   }
 
-  onThinking("generating", "Validating network graph...");
+  onThinking("generating", "Done!\n");
+  console.log("[analysis] Complete — nodes:", result.network?.nodes?.length);
   onStageChange("complete");
   return result;
 }

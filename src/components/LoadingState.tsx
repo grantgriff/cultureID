@@ -135,7 +135,7 @@ export default function LoadingState({ stage, thinkingLog }: LoadingStateProps) 
       </div>
 
       <p className="text-gray-500 text-xs">
-        This may take up to 90 seconds...
+        This may take up to 5 minutes...
       </p>
     </div>
   );
