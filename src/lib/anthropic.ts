@@ -259,39 +259,67 @@ ${ANALYSIS_PROMPT}`;
 
   let analysisText = "";
   let hasTransitionedToAnalyzing = false;
-  const analysisStream = client.messages.stream({
-    model: "claude-sonnet-4-20250514",
-    max_tokens: 16000,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: analysisPrompt }],
-  });
+  let analysisChunks = 0;
 
-  for await (const event of analysisStream) {
-    if (
-      event.type === "content_block_delta" &&
-      event.delta.type === "text_delta"
-    ) {
-      analysisText += event.delta.text;
+  try {
+    const analysisStream = client.messages.stream({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 16000,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: "user", content: analysisPrompt }],
+    });
 
-      // Transition UI from "mapping" to "analyzing" once we detect JSON output starting
-      if (!hasTransitionedToAnalyzing && analysisText.includes('"target"')) {
-        hasTransitionedToAnalyzing = true;
-        onStageChange("analyzing");
-        console.log("[analysis] Transitioned to analyzing stage");
+    analysisStream.on("error", (err) => {
+      console.error("[analysis] Stream error:", err);
+    });
+
+    for await (const event of analysisStream) {
+      if (
+        event.type === "content_block_delta" &&
+        event.delta.type === "text_delta"
+      ) {
+        analysisText += event.delta.text;
+        analysisChunks++;
+
+        // Transition UI from "mapping" to "analyzing" once we detect JSON output starting
+        if (!hasTransitionedToAnalyzing && analysisText.includes('"target"')) {
+          hasTransitionedToAnalyzing = true;
+          onStageChange("analyzing");
+          console.log("[analysis] Transitioned to analyzing stage");
+        }
+
+        onThinking(
+          hasTransitionedToAnalyzing ? "analyzing" : "mapping",
+          event.delta.text
+        );
       }
-
-      onThinking(
-        hasTransitionedToAnalyzing ? "analyzing" : "mapping",
-        event.delta.text
-      );
     }
+  } catch (streamErr) {
+    console.error(
+      "[analysis] Phase 2 stream failed after",
+      analysisChunks,
+      "chunks,",
+      analysisText.length,
+      "chars. Error:",
+      streamErr
+    );
+    throw new Error(
+      `Analysis stream failed: ${streamErr instanceof Error ? streamErr.message : "Unknown error"}`
+    );
   }
 
   console.log(
     "[analysis] Phase 2 complete:",
     analysisText.length,
-    "chars of output"
+    "chars of output,",
+    analysisChunks,
+    "chunks"
   );
+
+  if (!analysisText.trim()) {
+    console.error("[analysis] Phase 2 produced no output");
+    throw new Error("Analysis phase completed but produced no output.");
+  }
 
   // Phase 3: Parse and generate final output
   onStageChange("generating");
