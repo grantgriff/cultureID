@@ -67,6 +67,13 @@ export default function Home() {
               const completedLines = parts.slice(0, -1).filter((l: string) => l.trim().length > 0);
               thinkingBuffer.current[tStage] = parts[parts.length - 1];
 
+              // Also flush partial line if it's long enough (handles text without newlines)
+              const partial = thinkingBuffer.current[tStage];
+              if (partial.length > 80) {
+                completedLines.push(partial.trimEnd());
+                thinkingBuffer.current[tStage] = "";
+              }
+
               if (completedLines.length > 0) {
                 setThinkingLog((prev) => ({
                   ...prev,

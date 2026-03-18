@@ -192,6 +192,7 @@ After completing all searches, compile everything you found into a detailed summ
 Be thorough but factual — only report what you actually find.`;
 
   let searchFindings = "";
+  let searchCount = 0;
   const searchStream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
     max_tokens: 16000,
@@ -207,7 +208,19 @@ Be thorough but factual — only report what you actually find.`;
   });
 
   for await (const event of searchStream) {
-    if (
+    if (event.type === "content_block_start") {
+      // Detect when a web search tool call starts
+      if (
+        event.content_block.type === "server_tool_use" &&
+        event.content_block.name === "web_search"
+      ) {
+        searchCount++;
+        onThinking(
+          "searching",
+          `Running search ${searchCount}...\n`
+        );
+      }
+    } else if (
       event.type === "content_block_delta" &&
       event.delta.type === "text_delta"
     ) {
