@@ -161,6 +161,7 @@ export async function runAnalysis(
 ): Promise<AnalysisResult> {
   const queries = buildSearchQueries(input);
   const modeContext = getModeContext(input.mode);
+  const client = getClient();
 
   // Phase 1: Web search to gather data
   onStageChange("searching");
@@ -184,9 +185,9 @@ After completing all searches, compile everything you found into a detailed summ
 
 Be thorough but factual — only report what you actually find.`;
 
-  const client = getClient();
-
-  const searchResponse = await client.messages.create({
+  // Use streaming to keep the connection alive during long API calls
+  let searchFindings = "";
+  const searchStream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
     max_tokens: 16000,
     system: SYSTEM_PROMPT,
@@ -200,11 +201,12 @@ Be thorough but factual — only report what you actually find.`;
     messages: [{ role: "user", content: searchPrompt }],
   });
 
-  // Extract text content from search response
-  let searchFindings = "";
-  for (const block of searchResponse.content) {
-    if (block.type === "text") {
-      searchFindings += block.text;
+  for await (const event of searchStream) {
+    if (
+      event.type === "content_block_delta" &&
+      event.delta.type === "text_delta"
+    ) {
+      searchFindings += event.delta.text;
     }
   }
 
@@ -219,18 +221,20 @@ ${modeContext}
 
 Now produce the structured analysis. ${ANALYSIS_PROMPT}`;
 
-  const analysisResponse = await client.messages.create({
+  let analysisText = "";
+  const analysisStream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
     max_tokens: 16000,
     system: SYSTEM_PROMPT,
     messages: [{ role: "user", content: analysisPrompt }],
   });
 
-  // Extract JSON from analysis response
-  let analysisText = "";
-  for (const block of analysisResponse.content) {
-    if (block.type === "text") {
-      analysisText += block.text;
+  for await (const event of analysisStream) {
+    if (
+      event.type === "content_block_delta" &&
+      event.delta.type === "text_delta"
+    ) {
+      analysisText += event.delta.text;
     }
   }
 

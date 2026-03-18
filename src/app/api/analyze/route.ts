@@ -1,36 +1,56 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest } from "next/server";
 import { runAnalysis } from "@/lib/anthropic";
 import { AnalysisInput } from "@/lib/types";
 
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
-  try {
-    const input: AnalysisInput = await req.json();
+  const encoder = new TextEncoder();
 
-    if (!input.name?.trim()) {
-      return NextResponse.json({ error: "Name is required" }, { status: 400 });
-    }
+  const stream = new ReadableStream({
+    async start(controller) {
+      function send(event: string, data: unknown) {
+        controller.enqueue(
+          encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+        );
+      }
 
-    if (!["hire", "customer", "employer"].includes(input.mode)) {
-      return NextResponse.json(
-        { error: "Invalid analysis mode" },
-        { status: 400 }
-      );
-    }
+      try {
+        const input: AnalysisInput = await req.json();
 
-    // For MVP, we run the full analysis and return the result
-    // A streaming approach would be better for UX but adds complexity
-    const result = await runAnalysis(input, (stage) => {
-      // In MVP, stage changes aren't streamed to client
-      console.log(`Analysis stage: ${stage}`);
-    });
+        if (!input.name?.trim()) {
+          send("error", { error: "Name is required" });
+          controller.close();
+          return;
+        }
 
-    return NextResponse.json(result);
-  } catch (error) {
-    console.error("Analysis error:", error);
-    const message =
-      error instanceof Error ? error.message : "Analysis failed";
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
+        if (!["hire", "customer", "employer"].includes(input.mode)) {
+          send("error", { error: "Invalid analysis mode" });
+          controller.close();
+          return;
+        }
+
+        const result = await runAnalysis(input, (stage) => {
+          send("stage", { stage });
+        });
+
+        send("result", result);
+        controller.close();
+      } catch (error) {
+        console.error("Analysis error:", error);
+        const message =
+          error instanceof Error ? error.message : "Analysis failed";
+        send("error", { error: message });
+        controller.close();
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
 }
