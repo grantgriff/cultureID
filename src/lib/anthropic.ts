@@ -1,9 +1,15 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { AnalysisInput, AnalysisResult, AnalysisMode } from "./types";
 
-const client = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+function getClient() {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "ANTHROPIC_API_KEY environment variable is not set. Add it to your hosting platform's environment variables."
+    );
+  }
+  return new Anthropic({ apiKey });
+}
 
 const SYSTEM_PROMPT = `You are a culture sensing analyst. Your job is to analyze publicly available information about a person to infer:
 1. Their professional network structure and key relationships
@@ -177,6 +183,8 @@ After completing all searches, compile everything you found into a detailed summ
 - Any relevant patterns you notice
 
 Be thorough but factual — only report what you actually find.`;
+
+  const client = getClient();
 
   const searchResponse = await client.messages.create({
     model: "claude-sonnet-4-20250514",
