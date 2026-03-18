@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import { AnalysisInput, AnalysisResult, AnalysisStage } from "@/lib/types";
 import InputForm from "@/components/InputForm";
 import LoadingState from "@/components/LoadingState";
@@ -11,11 +11,15 @@ export default function Home() {
   const [stage, setStage] = useState<AnalysisStage>("idle");
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [thinkingLog, setThinkingLog] = useState<Record<string, string[]>>({});
+  const thinkingBuffer = useRef<Record<string, string>>({});
 
   const handleSubmit = async (input: AnalysisInput) => {
     setStage("searching");
     setResult(null);
     setError(null);
+    setThinkingLog({});
+    thinkingBuffer.current = {};
 
     try {
       const res = await fetch("/api/analyze", {
@@ -50,6 +54,25 @@ export default function Home() {
             const data = JSON.parse(line.slice(6));
             if (currentEvent === "stage") {
               setStage(data.stage);
+            } else if (currentEvent === "thinking") {
+              const { stage: tStage, text } = data;
+              // Buffer incoming text fragments and split into lines
+              if (!thinkingBuffer.current[tStage]) {
+                thinkingBuffer.current[tStage] = "";
+              }
+              thinkingBuffer.current[tStage] += text;
+
+              // Split on newlines, keep the last partial line in the buffer
+              const parts = thinkingBuffer.current[tStage].split("\n");
+              const completedLines = parts.slice(0, -1).filter((l: string) => l.trim().length > 0);
+              thinkingBuffer.current[tStage] = parts[parts.length - 1];
+
+              if (completedLines.length > 0) {
+                setThinkingLog((prev) => ({
+                  ...prev,
+                  [tStage]: [...(prev[tStage] || []), ...completedLines],
+                }));
+              }
             } else if (currentEvent === "result") {
               setResult(data as AnalysisResult);
               setStage("complete");
@@ -69,6 +92,8 @@ export default function Home() {
     setStage("idle");
     setResult(null);
     setError(null);
+    setThinkingLog({});
+    thinkingBuffer.current = {};
   };
 
   const isLoading = ["searching", "mapping", "analyzing", "generating"].includes(stage);
@@ -121,7 +146,7 @@ export default function Home() {
         )}
 
         {/* Loading State */}
-        {isLoading && <LoadingState stage={stage} />}
+        {isLoading && <LoadingState stage={stage} thinkingLog={thinkingLog} />}
 
         {/* Error State */}
         {stage === "error" && (

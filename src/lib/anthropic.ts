@@ -155,10 +155,16 @@ IMPORTANT RULES:
 - Every node referenced in edges must exist in the nodes array
 - Every node must belong to at least one cluster`;
 
+export interface AnalysisCallbacks {
+  onStageChange: (stage: string) => void;
+  onThinking: (stage: string, text: string) => void;
+}
+
 export async function runAnalysis(
   input: AnalysisInput,
-  onStageChange: (stage: string) => void
+  callbacks: AnalysisCallbacks
 ): Promise<AnalysisResult> {
+  const { onStageChange, onThinking } = callbacks;
   const queries = buildSearchQueries(input);
   const modeContext = getModeContext(input.mode);
   const client = getClient();
@@ -185,7 +191,6 @@ After completing all searches, compile everything you found into a detailed summ
 
 Be thorough but factual — only report what you actually find.`;
 
-  // Use streaming to keep the connection alive during long API calls
   let searchFindings = "";
   const searchStream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
@@ -207,15 +212,54 @@ Be thorough but factual — only report what you actually find.`;
       event.delta.type === "text_delta"
     ) {
       searchFindings += event.delta.text;
+      onThinking("searching", event.delta.text);
     }
   }
 
-  // Phase 2: Analysis and structuring
+  // Phase 2: Map connections from search findings
+  onStageChange("mapping");
+
+  const mappingPrompt = `Here are raw research findings about ${input.name}:
+
+${searchFindings}
+
+From these findings, extract a structured map of all people, organizations, and relationships found. For each person identified:
+- Name, company, title (if found)
+- How they relate to ${input.name} (direct colleague, co-author, mentioned together, etc.)
+- Strength of evidence for the connection
+
+Also identify clusters — groups of people who belong together (e.g. same company, same conference circuit, co-authors).
+
+Output a detailed structured summary of the network. Be factual — only include connections with evidence from the search results.`;
+
+  let mappingFindings = "";
+  const mappingStream = client.messages.stream({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 8000,
+    system: SYSTEM_PROMPT,
+    messages: [{ role: "user", content: mappingPrompt }],
+  });
+
+  for await (const event of mappingStream) {
+    if (
+      event.type === "content_block_delta" &&
+      event.delta.type === "text_delta"
+    ) {
+      mappingFindings += event.delta.text;
+      onThinking("mapping", event.delta.text);
+    }
+  }
+
+  // Phase 3: Analyze cultural signals
   onStageChange("analyzing");
 
   const analysisPrompt = `Here are the research findings about ${input.name}:
 
 ${searchFindings}
+
+Here is the structured network mapping:
+
+${mappingFindings}
 
 ${modeContext}
 
@@ -235,15 +279,42 @@ Now produce the structured analysis. ${ANALYSIS_PROMPT}`;
       event.delta.type === "text_delta"
     ) {
       analysisText += event.delta.text;
+      onThinking("analyzing", event.delta.text);
     }
   }
+
+  // Phase 4: Parse and generate final output
+  onStageChange("generating");
+  onThinking("generating", "Parsing structured output...");
 
   // Parse JSON — handle potential markdown fencing
   const jsonMatch = analysisText.match(/```(?:json)?\s*([\s\S]*?)```/);
   const jsonStr = jsonMatch ? jsonMatch[1].trim() : analysisText.trim();
 
-  const result: AnalysisResult = JSON.parse(jsonStr);
+  let result: AnalysisResult;
+  try {
+    result = JSON.parse(jsonStr);
+  } catch (parseError) {
+    // Try to extract JSON more aggressively — find first { to last }
+    const firstBrace = analysisText.indexOf("{");
+    const lastBrace = analysisText.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      const extracted = analysisText.slice(firstBrace, lastBrace + 1);
+      try {
+        result = JSON.parse(extracted);
+      } catch {
+        throw new Error(
+          "Failed to parse analysis output as JSON. The model returned malformed data."
+        );
+      }
+    } else {
+      throw new Error(
+        "Failed to parse analysis output. No JSON structure found in response."
+      );
+    }
+  }
 
+  onThinking("generating", "Validating network graph...");
   onStageChange("complete");
   return result;
 }
