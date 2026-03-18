@@ -11,19 +11,6 @@ function getClient() {
   return new Anthropic({ apiKey });
 }
 
-const SYSTEM_PROMPT = `You are a culture sensing analyst. Your job is to analyze publicly available information about a person to infer:
-1. Their professional network structure and key relationships
-2. Cultural signals from their public communications
-3. Risk flags or alignment indicators based on the user's context
-
-Ground your analysis in social network theory:
-- Identify hubs (high degree centrality), brokers (high betweenness), and peripheral nodes
-- Assess network density and centralization
-- Detect cultural markers in language patterns
-
-Be specific and evidence-based. Cite sources. Acknowledge uncertainty where data is limited.
-Never fabricate connections or data — only report what you actually find in search results.`;
-
 function buildSearchQueries(input: AnalysisInput): string[] {
   const { name, company, title } = input;
   const nameCompany = company ? `${name} ${company}` : name;
@@ -49,24 +36,27 @@ function getModeContext(mode: AnalysisMode): string {
     case "hire":
       return `Context: POTENTIAL HIRE assessment.
 Focus on: cultural fit, collaboration patterns, pace alignment, reference backchannel opportunities.
-Key questions: Do their network patterns suggest collaboration or solo work? Does their posting behavior suggest their pace? Who are their strongest connections? Are there shared network connections?
 Emphasize: Cultural fit indicators, collaboration signals, potential red flags.`;
     case "customer":
       return `Context: POTENTIAL CUSTOMER assessment.
 Focus on: decision-making structure, implementation readiness, pace, internal champions and blockers.
-Key questions: How centralized is decision-making? Is their team technically sophisticated? What's their apparent pace? Who are the internal champions and blockers?
 Emphasize: Decision-making structure, implementation readiness, stakeholder map.`;
     case "employer":
       return `Context: POTENTIAL EMPLOYER assessment.
 Focus on: real culture beyond careers page, power dynamics, leadership style, work-life signals, turnover flags.
-Key questions: What's the real culture? Who holds power? What do employees signal about work-life? Are there turnover red flags?
 Emphasize: Leadership style, pace/intensity signals, employee sentiment patterns.`;
   }
 }
 
-const ANALYSIS_PROMPT = `Based on ALL the search results gathered, produce a comprehensive culture sensing analysis.
+const SYSTEM_PROMPT = `You are a culture sensing analyst. Analyze publicly available information about a person to infer:
+1. Their professional network structure and key relationships
+2. Cultural signals from their public communications
+3. Risk flags or alignment indicators based on the user's context
 
-You MUST output valid JSON matching this exact schema (no markdown fencing, just raw JSON):
+Ground your analysis in social network theory. Be specific and evidence-based.
+Never fabricate connections or data — only report what you actually find in search results.`;
+
+const JSON_SCHEMA = `You MUST output valid JSON matching this exact schema (no markdown fencing, just raw JSON):
 {
   "target": {
     "name": "string",
@@ -120,40 +110,16 @@ You MUST output valid JSON matching this exact schema (no markdown fencing, just
   ],
   "recommendations": ["string"],
   "data_limitations": ["string"],
-  "report_markdown": "string (full markdown report as specified below)"
+  "report_markdown": "string (full markdown report)"
 }
 
-For the report_markdown field, generate a complete report following this structure:
-# Culture Sensing Report: [Target Name]
-## Context: [Hire / Customer / Employer]
-## Generated: [Today's date]
-
-### Executive Summary
-[2-3 sentence overview]
-
-### Network Structure
-[Network size, density, centralization, key clusters, power map table]
-
-### Cultural Signals
-[Pace & Intensity, Collaboration Orientation, Work-Life Indicators, Values - each with score and evidence]
-
-### Risk Flags
-[Bulleted list or "No significant risk flags detected"]
-
-### Recommendations
-[Context-specific recommendations]
-
-### Methodology Note
-This analysis is based on publicly available data and should be used to augment - not replace - direct engagement. Signals may be incomplete or reflect curated personas.
-
-IMPORTANT RULES:
-- Only include people and connections you actually found evidence for in search results
+RULES:
+- Only include people/connections you found evidence for
 - Do not fabricate nodes or edges
-- If data is limited, say so and keep the network small
-- Aim for at least 5-15 nodes if the person has a public presence
 - Always include the target person as a node with id "target"
-- Every node referenced in edges must exist in the nodes array
-- Every node must belong to at least one cluster`;
+- Every node referenced in edges must exist in nodes array
+- Every node must belong to at least one cluster
+- report_markdown should include: Executive Summary, Network Structure, Cultural Signals, Risk Flags, Recommendations, and a Methodology Note`;
 
 export interface AnalysisCallbacks {
   onStageChange: (stage: string) => void;
@@ -170,11 +136,11 @@ export async function runAnalysis(
   const modeContext = getModeContext(input.mode);
   const client = getClient();
 
-  // Phase 1: Web search to gather data
+  // Single combined call: search + analyze in one request
   onStageChange("searching");
-  console.log("[analysis] Phase 1: Starting web search for", input.name);
+  console.log("[analysis] Starting combined search + analysis for", input.name);
 
-  const searchPrompt = `I need you to research the following person for a culture sensing analysis:
+  const prompt = `Research and analyze this person for a culture sensing report:
 
 Name: ${input.name}
 ${input.company ? `Company: ${input.company}` : ""}
@@ -182,20 +148,19 @@ ${input.title ? `Title: ${input.title}` : ""}
 
 ${modeContext}
 
-Please search for this person using the following queries (use the web_search tool for each):
+STEP 1: Search for this person using these queries (use the web_search tool for each):
 ${queries.map((q, i) => `${i + 1}. ${q}`).join("\n")}
 
-After completing all searches, compile everything you found into a detailed summary. Include:
-- All people mentioned in connection with the target
-- Any cultural signals from posts, articles, or quotes
-- Company information and team structure
-- Any relevant patterns you notice
+STEP 2: After ALL searches are complete, produce the structured JSON analysis.
 
-Be thorough but factual — only report what you actually find.`;
+${JSON_SCHEMA}`;
 
-  let searchFindings = "";
+  let fullText = "";
   let searchCount = 0;
-  const searchStream = client.messages.stream({
+  let chunks = 0;
+  let inJsonOutput = false;
+
+  const stream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
     max_tokens: 16000,
     system: SYSTEM_PROMPT,
@@ -206,10 +171,14 @@ Be thorough but factual — only report what you actually find.`;
         max_uses: 10,
       },
     ],
-    messages: [{ role: "user", content: searchPrompt }],
+    messages: [{ role: "user", content: prompt }],
   });
 
-  for await (const event of searchStream) {
+  stream.on("error", (err) => {
+    console.error("[analysis] Stream error:", err);
+  });
+
+  for await (const event of stream) {
     if (event.type === "content_block_start") {
       if (
         event.content_block.type === "server_tool_use" &&
@@ -222,154 +191,75 @@ Be thorough but factual — only report what you actually find.`;
       event.type === "content_block_delta" &&
       event.delta.type === "text_delta"
     ) {
-      searchFindings += event.delta.text;
-      onThinking("searching", event.delta.text);
-    }
-  }
+      fullText += event.delta.text;
+      chunks++;
 
-  console.log(
-    "[analysis] Phase 1 complete:",
-    searchCount,
-    "searches,",
-    searchFindings.length,
-    "chars of findings"
-  );
-
-  if (!searchFindings.trim()) {
-    console.warn("[analysis] Warning: searchFindings is empty after web search phase");
-    throw new Error(
-      "Web search completed but produced no text summary. The search may have timed out."
-    );
-  }
-
-  // Phase 2: Map connections + analyze (single call to reduce latency/timeout risk)
-  onStageChange("mapping");
-  onThinking("mapping", "Extracting network connections from findings...\n");
-  const phase2Start = Date.now();
-  console.log("[analysis] Phase 2: Starting mapping + analysis. Time since start:", Math.round((Date.now() - analysisStart) / 1000), "s");
-
-  const analysisPrompt = `Here are the research findings about ${input.name}:
-
-${searchFindings}
-
-${modeContext}
-
-First, mentally map out all the people, organizations, and relationships found in the research.
-Then produce the structured analysis.
-
-${ANALYSIS_PROMPT}`;
-
-  let analysisText = "";
-  let hasTransitionedToAnalyzing = false;
-  let analysisChunks = 0;
-
-  try {
-    const analysisStream = client.messages.stream({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 16000,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: analysisPrompt }],
-    });
-
-    analysisStream.on("error", (err) => {
-      console.error("[analysis] Stream error at", Math.round((Date.now() - phase2Start) / 1000), "s:", err);
-    });
-
-    console.log("[analysis] Phase 2: Stream created, waiting for first chunk...");
-
-    for await (const event of analysisStream) {
-      if (analysisChunks === 0) {
-        console.log("[analysis] Phase 2: First chunk received after", Math.round((Date.now() - phase2Start) / 1000), "s");
-      }
-      if (
-        event.type === "content_block_delta" &&
-        event.delta.type === "text_delta"
-      ) {
-        analysisText += event.delta.text;
-        analysisChunks++;
-
-        // Transition UI from "mapping" to "analyzing" once we detect JSON output starting
-        if (!hasTransitionedToAnalyzing && analysisText.includes('"target"')) {
-          hasTransitionedToAnalyzing = true;
-          onStageChange("analyzing");
-          console.log("[analysis] Transitioned to analyzing stage");
-        }
-
-        onThinking(
-          hasTransitionedToAnalyzing ? "analyzing" : "mapping",
-          event.delta.text
+      // Detect transition from search summary to JSON output
+      if (!inJsonOutput && fullText.includes('"target"')) {
+        inJsonOutput = true;
+        onStageChange("mapping");
+        onThinking("mapping", "Building network map...\n");
+        console.log(
+          "[analysis] JSON output started at",
+          Math.round((Date.now() - analysisStart) / 1000),
+          "s"
         );
       }
+
+      // Update UI stage based on JSON progress
+      if (inJsonOutput) {
+        if (fullText.includes('"cultural_signals"')) {
+          onStageChange("analyzing");
+        }
+        if (fullText.includes('"report_markdown"')) {
+          onStageChange("generating");
+        }
+        onThinking("analyzing", event.delta.text);
+      } else {
+        onThinking("searching", event.delta.text);
+      }
     }
-  } catch (streamErr) {
-    console.error(
-      "[analysis] Phase 2 stream failed after",
-      analysisChunks,
-      "chunks,",
-      analysisText.length,
-      "chars. Error:",
-      streamErr
-    );
-    throw new Error(
-      `Analysis stream failed: ${streamErr instanceof Error ? streamErr.message : "Unknown error"}`
-    );
   }
 
   console.log(
-    "[analysis] Phase 2 complete:",
-    analysisText.length,
-    "chars of output,",
-    analysisChunks,
-    "chunks. Took",
-    Math.round((Date.now() - phase2Start) / 1000),
-    "s. Total elapsed:",
-    Math.round((Date.now() - analysisStart) / 1000),
-    "s"
+    "[analysis] Stream complete:",
+    searchCount, "searches,",
+    chunks, "chunks,",
+    fullText.length, "chars.",
+    "Total:", Math.round((Date.now() - analysisStart) / 1000), "s"
   );
 
-  if (!analysisText.trim()) {
-    console.error("[analysis] Phase 2 produced no output");
-    throw new Error("Analysis phase completed but produced no output.");
+  if (!fullText.trim()) {
+    throw new Error("Analysis produced no output.");
   }
 
-  // Phase 3: Parse and generate final output
+  // Parse JSON from the response
   onStageChange("generating");
-  onThinking("generating", "Parsing structured output...\n");
-  console.log("[analysis] Phase 3: Parsing JSON output");
+  onThinking("generating", "Parsing results...\n");
 
-  // Parse JSON — handle potential markdown fencing
-  const jsonMatch = analysisText.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const jsonStr = jsonMatch ? jsonMatch[1].trim() : analysisText.trim();
+  const jsonMatch = fullText.match(/```(?:json)?\s*([\s\S]*?)```/);
+  let jsonStr = jsonMatch ? jsonMatch[1].trim() : null;
+
+  if (!jsonStr) {
+    // Find first { to last }
+    const firstBrace = fullText.indexOf("{");
+    const lastBrace = fullText.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      jsonStr = fullText.slice(firstBrace, lastBrace + 1);
+    }
+  }
+
+  if (!jsonStr) {
+    console.error("[analysis] No JSON found. First 300 chars:", fullText.slice(0, 300));
+    throw new Error("No JSON structure found in response.");
+  }
 
   let result: AnalysisResult;
   try {
     result = JSON.parse(jsonStr);
   } catch {
-    // Try to extract JSON more aggressively — find first { to last }
-    const firstBrace = analysisText.indexOf("{");
-    const lastBrace = analysisText.lastIndexOf("}");
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-      const extracted = analysisText.slice(firstBrace, lastBrace + 1);
-      try {
-        result = JSON.parse(extracted);
-      } catch {
-        console.error(
-          "[analysis] JSON parse failed. First 200 chars:",
-          analysisText.slice(0, 200)
-        );
-        throw new Error(
-          "Failed to parse analysis output as JSON. The model returned malformed data."
-        );
-      }
-    } else {
-      console.error(
-        "[analysis] No JSON found. First 200 chars:",
-        analysisText.slice(0, 200)
-      );
-      throw new Error(
-        "Failed to parse analysis output. No JSON structure found in response."
-      );
-    }
+    console.error("[analysis] JSON parse failed. First 300 chars:", jsonStr.slice(0, 300));
+    throw new Error("Failed to parse analysis output as JSON.");
   }
 
   onThinking("generating", "Done!\n");
