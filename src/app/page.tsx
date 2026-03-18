@@ -7,12 +7,100 @@ import LoadingState from "@/components/LoadingState";
 import NetworkGraph from "@/components/NetworkGraph";
 import ReportView from "@/components/ReportView";
 
+/** Read an SSE stream, calling onText for thinking chunks. Returns the "done" result. */
+async function readStepStream(
+  res: Response,
+  onText: (text: string) => void
+): Promise<string> {
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response stream");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let currentEvent = "";
+  let result = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (line.startsWith("event: ")) {
+        currentEvent = line.slice(7);
+      } else if (line.startsWith("data: ")) {
+        const data = JSON.parse(line.slice(6));
+        if (currentEvent === "thinking") {
+          onText(data.text);
+        } else if (currentEvent === "done") {
+          result = typeof data.result === "string" ? data.result : JSON.stringify(data.result);
+        } else if (currentEvent === "error") {
+          throw new Error(data.error);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+/** Make one step call to the API */
+async function callStep(
+  step: string,
+  body: Record<string, unknown>,
+  onText: (text: string) => void
+): Promise<string> {
+  const res = await fetch("/api/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step, ...body }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Step "${step}" request failed (${res.status})`);
+  }
+
+  return readStepStream(res, onText);
+}
+
 export default function Home() {
   const [stage, setStage] = useState<AnalysisStage>("idle");
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [thinkingLog, setThinkingLog] = useState<Record<string, string[]>>({});
   const thinkingBuffer = useRef<Record<string, string>>({});
+
+  /** Flush incoming text into thinkingLog lines for a given stage */
+  function makeOnText(stageName: string) {
+    return (text: string) => {
+      if (!thinkingBuffer.current[stageName]) {
+        thinkingBuffer.current[stageName] = "";
+      }
+      thinkingBuffer.current[stageName] += text;
+
+      const parts = thinkingBuffer.current[stageName].split("\n");
+      const completedLines = parts
+        .slice(0, -1)
+        .filter((l: string) => l.trim().length > 0);
+      thinkingBuffer.current[stageName] = parts[parts.length - 1];
+
+      const partial = thinkingBuffer.current[stageName];
+      if (partial.length > 80) {
+        completedLines.push(partial.trimEnd());
+        thinkingBuffer.current[stageName] = "";
+      }
+
+      if (completedLines.length > 0) {
+        setThinkingLog((prev) => ({
+          ...prev,
+          [stageName]: [...(prev[stageName] || []), ...completedLines],
+        }));
+      }
+    };
+  }
 
   const handleSubmit = async (input: AnalysisInput) => {
     setStage("searching");
@@ -22,73 +110,41 @@ export default function Home() {
     thinkingBuffer.current = {};
 
     try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(input),
-      });
+      // Step 1: Web search — own 300s budget
+      setStage("searching");
+      const searchFindings = await callStep(
+        "search",
+        { input },
+        makeOnText("searching")
+      );
 
-      if (!res.ok) {
-        throw new Error("Analysis request failed");
-      }
+      // Step 2: Network mapping — own 300s budget
+      setStage("mapping");
+      const networkJson = await callStep(
+        "network",
+        { input, searchFindings },
+        makeOnText("mapping")
+      );
 
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error("No response stream");
+      // Step 3: Cultural analysis — own 300s budget
+      setStage("analyzing");
+      const culturalJson = await callStep(
+        "culture",
+        { input, searchFindings },
+        makeOnText("analyzing")
+      );
 
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let currentEvent = "";
+      // Step 4: Report + assemble — own 300s budget
+      setStage("generating");
+      const finalResultStr = await callStep(
+        "report",
+        { input, searchFindings, networkJson, culturalJson },
+        makeOnText("generating")
+      );
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("event: ")) {
-            currentEvent = line.slice(7);
-          } else if (line.startsWith("data: ")) {
-            const data = JSON.parse(line.slice(6));
-            if (currentEvent === "stage") {
-              setStage(data.stage);
-            } else if (currentEvent === "thinking") {
-              const { stage: tStage, text } = data;
-              // Buffer incoming text fragments and split into lines
-              if (!thinkingBuffer.current[tStage]) {
-                thinkingBuffer.current[tStage] = "";
-              }
-              thinkingBuffer.current[tStage] += text;
-
-              // Split on newlines, keep the last partial line in the buffer
-              const parts = thinkingBuffer.current[tStage].split("\n");
-              const completedLines = parts.slice(0, -1).filter((l: string) => l.trim().length > 0);
-              thinkingBuffer.current[tStage] = parts[parts.length - 1];
-
-              // Also flush partial line if it's long enough (handles text without newlines)
-              const partial = thinkingBuffer.current[tStage];
-              if (partial.length > 80) {
-                completedLines.push(partial.trimEnd());
-                thinkingBuffer.current[tStage] = "";
-              }
-
-              if (completedLines.length > 0) {
-                setThinkingLog((prev) => ({
-                  ...prev,
-                  [tStage]: [...(prev[tStage] || []), ...completedLines],
-                }));
-              }
-            } else if (currentEvent === "result") {
-              setResult(data as AnalysisResult);
-              setStage("complete");
-            } else if (currentEvent === "error") {
-              throw new Error(data.error);
-            }
-          }
-        }
-      }
+      const finalResult: AnalysisResult = JSON.parse(finalResultStr);
+      setResult(finalResult);
+      setStage("complete");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
       setStage("error");

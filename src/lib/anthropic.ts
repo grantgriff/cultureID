@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { AnalysisInput, AnalysisResult, AnalysisMode } from "./types";
+import { AnalysisInput, AnalysisMode } from "./types";
 
 function getClient() {
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -50,12 +50,12 @@ Emphasize: Leadership style, pace/intensity signals, employee sentiment patterns
 
 const SYSTEM_PROMPT = `You are a culture sensing analyst. Analyze publicly available information about a person to infer network structure, cultural signals, and risk flags. Be specific and evidence-based. Never fabricate connections or data.`;
 
-export interface AnalysisCallbacks {
-  onStageChange: (stage: string) => void;
-  onThinking: (stage: string, text: string) => void;
+export interface StepCallbacks {
+  onText: (text: string) => void;
+  onToolUse?: (name: string) => void;
 }
 
-/** Helper: stream a Claude call, collect text, send chunks to UI */
+/** Stream a Claude call, collect text, send chunks to caller */
 async function streamCall(
   client: Anthropic,
   params: {
@@ -64,10 +64,7 @@ async function streamCall(
     max_tokens: number;
     tools?: Anthropic.Messages.Tool[];
   },
-  callbacks: {
-    onText: (text: string) => void;
-    onToolUse?: (name: string) => void;
-  }
+  callbacks: StepCallbacks
 ): Promise<string> {
   const stream = client.messages.stream({
     model: "claude-sonnet-4-20250514",
@@ -99,23 +96,17 @@ async function streamCall(
   return text;
 }
 
-export async function runAnalysis(
-  input: AnalysisInput,
-  callbacks: AnalysisCallbacks
-): Promise<AnalysisResult> {
-  const { onStageChange, onThinking } = callbacks;
-  const start = Date.now();
-  const elapsed = () => Math.round((Date.now() - start) / 1000);
-  const queries = buildSearchQueries(input);
-  const modeContext = getModeContext(input.mode);
-  const client = getClient();
+// ── Step 1: Web search ────────────────────────────────────────────────
 
-  // ── Call 1: Web search ──────────────────────────────────────────────
-  onStageChange("searching");
-  console.log("[analysis] Call 1: Web search for", input.name);
+export async function runSearch(
+  input: AnalysisInput,
+  callbacks: StepCallbacks
+): Promise<string> {
+  const client = getClient();
+  const queries = buildSearchQueries(input);
 
   let searchCount = 0;
-  const searchFindings = await streamCall(
+  const findings = await streamCall(
     client,
     {
       prompt: `Research this person for a culture sensing analysis:
@@ -138,25 +129,31 @@ After all searches, compile a detailed summary of everything found: people menti
       ],
     },
     {
-      onText: (text) => onThinking("searching", text),
+      onText: callbacks.onText,
       onToolUse: () => {
         searchCount++;
-        onThinking("searching", `Running search ${searchCount}...\n`);
+        callbacks.onText(`\nRunning search ${searchCount}...\n`);
       },
     }
   );
 
-  console.log("[analysis] Call 1 done:", searchCount, "searches,", searchFindings.length, "chars.", elapsed(), "s");
-
-  if (!searchFindings.trim()) {
+  if (!findings.trim()) {
     throw new Error("Web search produced no results.");
   }
 
-  // ── Call 2: Identify stakeholders & network ─────────────────────────
-  onStageChange("mapping");
-  console.log("[analysis] Call 2: Stakeholders + network.", elapsed(), "s");
+  return findings;
+}
 
-  const networkJson = await streamCall(
+// ── Step 2: Identify stakeholders & network ───────────────────────────
+
+export async function runNetwork(
+  input: AnalysisInput,
+  searchFindings: string,
+  callbacks: StepCallbacks
+): Promise<string> {
+  const client = getClient();
+
+  return streamCall(
     client,
     {
       prompt: `Based on these research findings, identify the network of people and organizations connected to ${input.name}.
@@ -178,18 +175,21 @@ Output valid JSON (no markdown fencing) with this structure:
 RULES: Always include target as node id "target". Every node in edges must exist in nodes. Every node must be in a cluster. Only include people you found evidence for.`,
       max_tokens: 6000,
     },
-    {
-      onText: (text) => onThinking("mapping", text),
-    }
+    callbacks
   );
+}
 
-  console.log("[analysis] Call 2 done:", networkJson.length, "chars.", elapsed(), "s");
+// ── Step 3: Cultural signals + risk flags ─────────────────────────────
 
-  // ── Call 3: Cultural signals + risk flags ───────────────────────────
-  onStageChange("analyzing");
-  console.log("[analysis] Call 3: Cultural signals.", elapsed(), "s");
+export async function runCulture(
+  input: AnalysisInput,
+  searchFindings: string,
+  callbacks: StepCallbacks
+): Promise<string> {
+  const client = getClient();
+  const modeContext = getModeContext(input.mode);
 
-  const culturalJson = await streamCall(
+  return streamCall(
     client,
     {
       prompt: `Analyze cultural signals for ${input.name} based on these research findings.
@@ -213,18 +213,23 @@ Output valid JSON (no markdown fencing):
 }`,
       max_tokens: 4000,
     },
-    {
-      onText: (text) => onThinking("analyzing", text),
-    }
+    callbacks
   );
+}
 
-  console.log("[analysis] Call 3 done:", culturalJson.length, "chars.", elapsed(), "s");
+// ── Step 4: Generate markdown report ──────────────────────────────────
 
-  // ── Call 4: Generate markdown report ────────────────────────────────
-  onStageChange("generating");
-  console.log("[analysis] Call 4: Report generation.", elapsed(), "s");
+export async function runReport(
+  input: AnalysisInput,
+  searchFindings: string,
+  networkJson: string,
+  culturalJson: string,
+  callbacks: StepCallbacks
+): Promise<string> {
+  const client = getClient();
+  const modeContext = getModeContext(input.mode);
 
-  const reportMarkdown = await streamCall(
+  return streamCall(
     client,
     {
       prompt: `Generate a culture sensing report in markdown for ${input.name}.
@@ -254,44 +259,19 @@ Write a complete markdown report with these sections:
 Output ONLY the markdown, no JSON wrapping.`,
       max_tokens: 4000,
     },
-    {
-      onText: (text) => onThinking("generating", text),
-    }
+    callbacks
   );
-
-  console.log("[analysis] Call 4 done:", reportMarkdown.length, "chars.", elapsed(), "s");
-
-  // ── Assemble final result ───────────────────────────────────────────
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const networkData: any = parseJson(networkJson, "network");
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const culturalData: any = parseJson(culturalJson, "cultural");
-
-  const result: AnalysisResult = {
-    target: networkData.target,
-    network: networkData.network,
-    structure_metrics: networkData.structure_metrics,
-    cultural_signals: culturalData.cultural_signals,
-    risk_flags: culturalData.risk_flags || [],
-    recommendations: culturalData.recommendations || [],
-    data_limitations: culturalData.data_limitations || [],
-    report_markdown: reportMarkdown.trim(),
-  };
-
-  console.log("[analysis] Complete — nodes:", result.network?.nodes?.length, "Total:", elapsed(), "s");
-  onStageChange("complete");
-  return result;
 }
 
-function parseJson(text: string, label: string): Record<string, unknown> {
-  // Try raw first
+// ── JSON parser ───────────────────────────────────────────────────────
+
+export function parseJson(text: string, label: string): Record<string, unknown> {
   try {
     return JSON.parse(text.trim());
   } catch {
     // ignore
   }
 
-  // Try markdown fencing
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (fenced) {
     try {
@@ -301,7 +281,6 @@ function parseJson(text: string, label: string): Record<string, unknown> {
     }
   }
 
-  // Find first { to last }
   const first = text.indexOf("{");
   const last = text.lastIndexOf("}");
   if (first !== -1 && last > first) {
