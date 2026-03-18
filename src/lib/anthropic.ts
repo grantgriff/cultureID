@@ -1,7 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { AnalysisInput, AnalysisResult, AnalysisMode } from "./types";
 
-const client = new Anthropic();
+const client = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
 
 const SYSTEM_PROMPT = `You are a culture sensing analyst. Your job is to analyze publicly available information about a person to infer:
 1. Their professional network structure and key relationships
