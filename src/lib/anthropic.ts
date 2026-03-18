@@ -165,6 +165,7 @@ export async function runAnalysis(
   callbacks: AnalysisCallbacks
 ): Promise<AnalysisResult> {
   const { onStageChange, onThinking } = callbacks;
+  const analysisStart = Date.now();
   const queries = buildSearchQueries(input);
   const modeContext = getModeContext(input.mode);
   const client = getClient();
@@ -244,7 +245,8 @@ Be thorough but factual — only report what you actually find.`;
   // Phase 2: Map connections + analyze (single call to reduce latency/timeout risk)
   onStageChange("mapping");
   onThinking("mapping", "Extracting network connections from findings...\n");
-  console.log("[analysis] Phase 2: Starting mapping + analysis");
+  const phase2Start = Date.now();
+  console.log("[analysis] Phase 2: Starting mapping + analysis. Time since start:", Math.round((Date.now() - analysisStart) / 1000), "s");
 
   const analysisPrompt = `Here are the research findings about ${input.name}:
 
@@ -270,10 +272,15 @@ ${ANALYSIS_PROMPT}`;
     });
 
     analysisStream.on("error", (err) => {
-      console.error("[analysis] Stream error:", err);
+      console.error("[analysis] Stream error at", Math.round((Date.now() - phase2Start) / 1000), "s:", err);
     });
 
+    console.log("[analysis] Phase 2: Stream created, waiting for first chunk...");
+
     for await (const event of analysisStream) {
+      if (analysisChunks === 0) {
+        console.log("[analysis] Phase 2: First chunk received after", Math.round((Date.now() - phase2Start) / 1000), "s");
+      }
       if (
         event.type === "content_block_delta" &&
         event.delta.type === "text_delta"
@@ -313,7 +320,11 @@ ${ANALYSIS_PROMPT}`;
     analysisText.length,
     "chars of output,",
     analysisChunks,
-    "chunks"
+    "chunks. Took",
+    Math.round((Date.now() - phase2Start) / 1000),
+    "s. Total elapsed:",
+    Math.round((Date.now() - analysisStart) / 1000),
+    "s"
   );
 
   if (!analysisText.trim()) {
